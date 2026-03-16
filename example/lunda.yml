@@ -1,0 +1,15 @@
+name: Scan Forgotten Branches
+
+on:
+  workflow_dispatch: # Run manually
+  schedule:
+    - cron: '0 12 * * 1' # Every Monday at 12:00
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: your-username/lunda@v1
+        with:
+          days_threshold: 60 # optional, defaults to 90
