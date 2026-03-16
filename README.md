@@ -4,6 +4,8 @@
 
 With ❤️ from the human and the robot who finally played the symphony
 
+[Japanese](README-JP.md)
+
 ---
 
 Lunda is a lightweight, smart, and friendly GitHub Action tool designed to help developers and security-focused teams detect forgotten branches — branches that haven’t seen activity for a long time and may introduce maintenance or security risks.
