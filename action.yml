@@ -9,7 +9,11 @@ inputs:
   days_threshold:
     description: "Number of days of inactivity before a branch is considered forgotten"
     required: false
-    default: 90
+    default: "90"
+  workflow_path:
+    description: "Path to the workflow file that should be updated with the next scheduled run"
+    required: false
+    default: ".github/workflows/lunda.yml"
 
 runs:
   using: "node16"
