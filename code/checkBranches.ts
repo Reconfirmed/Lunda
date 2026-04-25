@@ -3,8 +3,17 @@ import { Octokit } from "@octokit/rest";
 // Initialize Octokit with the GITHUB_TOKEN from environment variables
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
+const repository = process.env.GITHUB_REPOSITORY;
+if (!repository) {
+  throw new Error("GITHUB_REPOSITORY environment variable is required (format: owner/repo)");
+}
+
 // GitHub gives repo in "owner/repo" format, e.g., "Reconfirmed/Lunda"
-const [owner, repo] = (process.env.GITHUB_REPOSITORY as string).split("/");
+const [owner, repo] = repository.split("/");
+
+if (!owner || !repo) {
+  throw new Error("GITHUB_REPOSITORY must be in owner/repo format");
+}
 
 // Parse the DAYS_THRESHOLD from environment variables, defaulting to 90
 const DAYS_THRESHOLD: number = parseInt(process.env.INPUT_DAYS_THRESHOLD || "90", 10);
@@ -14,6 +23,8 @@ const WORKFLOW_PATH: string = process.env.INPUT_WORKFLOW_PATH || ".github/workfl
 
 // Path to store our tracking data
 const TRACKING_FILE = "lunda-tracking.json";
+const MILLISECONDS_IN_DAY = 1000 * 60 * 60 * 24;
+const COMMIT_FETCH_CONCURRENCY = 10;
 
 interface BranchEntry {
   name: string;
@@ -110,8 +121,43 @@ async function getLatestCommit(branchName: string): Promise<{ date: string; sha:
 function calculateDaysUntilStale(lastCommitDate: string): number {
   const now = new Date();
   const commitDate = new Date(lastCommitDate);
-  const daysSinceLastCommit = (now.getTime() - commitDate.getTime()) / (1000 * 60 * 60 * 24);
+  const daysSinceLastCommit = (now.getTime() - commitDate.getTime()) / MILLISECONDS_IN_DAY;
   return Math.ceil(DAYS_THRESHOLD - daysSinceLastCommit);
+}
+
+function estimateDaysSinceLastCommit(entry: BranchEntry, now: Date): number {
+  const calculatedAt = new Date(entry.calculatedAt);
+  const elapsedDays = Math.max(0, Math.floor((now.getTime() - calculatedAt.getTime()) / MILLISECONDS_IN_DAY));
+  const estimatedAtCalculation = DAYS_THRESHOLD - entry.daysUntilStale;
+
+  return Math.max(0, estimatedAtCalculation + elapsedDays);
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let currentIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = currentIndex;
+      currentIndex++;
+
+      if (index >= items.length) {
+        return;
+      }
+
+      results[index] = await mapper(items[index]);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+
+  return results;
 }
 
 function calculateNextCronDate(daysFromNow: number): string {
@@ -208,22 +254,27 @@ async function fullScan(): Promise<TrackingData> {
 
   const branchNames = await getAllBranches();
   const now = new Date().toISOString();
-  const branches: BranchEntry[] = [];
 
-  for (const name of branchNames) {
-    const commit = await getLatestCommit(name);
-    if (!commit) {
-      console.log(`⚠️ Branch ${name} has no commits. Skipping.`);
-      continue;
-    }
+  const branchCandidates = await mapWithConcurrency(
+    branchNames,
+    COMMIT_FETCH_CONCURRENCY,
+    async (name): Promise<BranchEntry | null> => {
+      const commit = await getLatestCommit(name);
+      if (!commit) {
+        console.log(`⚠️ Branch ${name} has no commits. Skipping.`);
+        return null;
+      }
 
-    branches.push({
-      name,
-      sha: commit.sha,
-      daysUntilStale: calculateDaysUntilStale(commit.date),
-      calculatedAt: now,
-    });
-  }
+      return {
+        name,
+        sha: commit.sha,
+        daysUntilStale: calculateDaysUntilStale(commit.date),
+        calculatedAt: now,
+      };
+    },
+  );
+
+  const branches = branchCandidates.filter((branch): branch is BranchEntry => branch !== null);
 
   // sort by daysUntilStale ascending (soonest to stale first)
   branches.sort((a, b) => a.daysUntilStale - b.daysUntilStale);
@@ -238,7 +289,8 @@ async function optimizedCheck(tracking: TrackingData): Promise<{
   console.log("🔍 Performing optimized check...\n");
 
   const staleBranches: StaleBranch[] = [];
-  const now = new Date().toISOString();
+  const now = new Date();
+  const nowIso = now.toISOString();
   const { branches } = tracking;
 
   if (branches.length === 0) {
@@ -260,7 +312,7 @@ async function optimizedCheck(tracking: TrackingData): Promise<{
     console.log(`⏰ Branch ${first.name} is now stale.`);
     staleBranches.push({
       name: first.name,
-      daysSinceLastCommit: DAYS_THRESHOLD - first.daysUntilStale + Math.abs(first.daysUntilStale),
+      daysSinceLastCommit: estimateDaysSinceLastCommit(first, now),
     });
     branches.shift();
 
@@ -270,7 +322,7 @@ async function optimizedCheck(tracking: TrackingData): Promise<{
 
     first.sha = commit.sha;
     first.daysUntilStale = calculateDaysUntilStale(commit.date);
-    first.calculatedAt = now;
+    first.calculatedAt = nowIso;
 
     // walk forward through the rest of the list
     for (let i = 1; i < branches.length; i++) {
@@ -295,7 +347,7 @@ async function optimizedCheck(tracking: TrackingData): Promise<{
       console.log(`🔄 Branch ${entry.name} was also updated.`);
       entry.sha = entryCommit.sha;
       entry.daysUntilStale = calculateDaysUntilStale(entryCommit.date);
-      entry.calculatedAt = now;
+      entry.calculatedAt = nowIso;
     }
 
     // re-sort the list
@@ -315,7 +367,7 @@ function needsFullRescan(tracking: TrackingData | null): boolean {
   // it's been threshold days since last full scan
   const lastScan = new Date(tracking.lastFullScan);
   const now = new Date();
-  const daysSinceLastScan = (now.getTime() - lastScan.getTime()) / (1000 * 60 * 60 * 24);
+  const daysSinceLastScan = (now.getTime() - lastScan.getTime()) / MILLISECONDS_IN_DAY;
   return daysSinceLastScan >= DAYS_THRESHOLD;
 }
 
@@ -372,7 +424,7 @@ async function run(): Promise<void> {
       tracking.branches = tracking.branches.filter((b) => b.daysUntilStale > 0);
 
     } else {
-      const result = await optimizedCheck(tracking!);
+      const result = await optimizedCheck(tracking);
       staleBranches = result.staleBranches;
       tracking = result.updatedTracking;
     }
